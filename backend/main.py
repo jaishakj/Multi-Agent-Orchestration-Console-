@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import operator
 import os
 import secrets
 import sqlite3
@@ -18,9 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 DATABASE_URL = Path(os.getenv("AGENT_OPS_DB", "agent_ops.sqlite3"))
-SECRET_KEY = os.getenv("AGENT_OPS_SECRET", "dev-agent-ops-secret")
-
-
 class UserCreate(BaseModel):
     username: str = Field(min_length=3, max_length=48)
     password: str = Field(min_length=8, max_length=256)
@@ -243,7 +241,7 @@ def invoke_tool(invocation: ToolInvocation, _: str = Depends(current_user)) -> d
         allowed = set("0123456789+-*/(). ")
         if not expression or any(char not in allowed for char in expression):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Calculator expression contains unsupported characters")
-        return {"name": invocation.name, "result": eval(expression, {"__builtins__": {}}, {})}
+        return {"name": invocation.name, "result": safe_calculate(expression)}
     if invocation.name == "http_get":
         return {"name": invocation.name, "status": "planned", "url": invocation.args.get("url"), "note": "Network tool is defined but disabled by default for safe local runs."}
     return {"name": invocation.name, "result": invocation.args}
@@ -314,6 +312,27 @@ def simulate_execution(run_id: str, run: GraphRun) -> list[TraceEvent]:
         else:
             events.append(trace(run_id, node.id, f"{node.label} completed", "completed", {"completed_node": node.id}))
     return events
+
+
+def safe_calculate(expression: str) -> float:
+    """Evaluate a simple arithmetic expression without exposing Python builtins."""
+
+    import ast
+
+    operators = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+
+    def evaluate(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -evaluate(node.operand)
+        if isinstance(node, ast.BinOp) and type(node.op) in operators:
+            return operators[type(node.op)](evaluate(node.left), evaluate(node.right))
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsupported calculator expression")
+
+    return evaluate(ast.parse(expression, mode="eval"))
 
 
 def trace(run_id: str, node_id: str, event: str, status_value: Literal["queued", "running", "retrying", "completed", "failed"], state_delta: dict[str, Any], retry_count: int = 0) -> TraceEvent:
